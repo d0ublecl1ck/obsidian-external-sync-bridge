@@ -1,0 +1,39 @@
+.external-sync-task-editor {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+  background: var(--background-secondary);
+}
+
+.external-sync-inline-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+.external-sync-test-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.external-sync-test-row input {
+  flex: 1;
+}
+
+.external-sync-test-row select {
+  max-width: 200px;
+}
+
+.setting-item-control input[type="text"] {
+  min-width: 220px;
+}
+
+.external-sync-vault-list div {
+  border-radius: 4px;
+}
+
+.external-sync-vault-list {
+  margin-top: 8px;
+}

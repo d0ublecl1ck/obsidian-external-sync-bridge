@@ -16,10 +16,13 @@
   ],
   "author": "d0ublecl1ck",
   "license": "MIT",
+  "dependencies": {
+    "fs-extra": "^11.2.0",
+    "micromatch": "^4.0.5"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "esbuild": "^0.24.0",
-    "fs-extra": "^11.2.0",
     "typescript": "^5.7.2"
   }
 }
