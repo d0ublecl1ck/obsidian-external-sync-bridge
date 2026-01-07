@@ -1,0 +1,10 @@
+{
+  "id": "external-sync-bridge",
+  "name": "External Sync Bridge",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Sync external files or folders into a vault folder for backup.",
+  "author": "d0ublecl1ck",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}
