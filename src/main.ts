@@ -228,10 +228,6 @@ export default class ExternalSyncBridgePlugin extends Plugin {
       return { ok: false, reason: "源路径不存在" };
     }
 
-    if (path.isAbsolute(task.targetPath)) {
-      return { ok: false, reason: "目标路径必须是 Vault 内相对路径" };
-    }
-
     const targetBase = path.normalize(task.targetPath);
     const targetAbs = path.join(vaultBasePath, targetBase);
     const rel = path.relative(vaultBasePath, targetAbs);
