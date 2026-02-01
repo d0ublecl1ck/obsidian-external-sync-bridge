@@ -6,7 +6,7 @@ import { createHash } from "crypto";
 import micromatch from "micromatch";
 import { formatErrorReason, formatErrorReasonForNotice } from "./error";
 import { ensureCopyTargetCompatible } from "./fs-conflicts";
-import { buildSettingsExportFileName, resolveUniqueFilePath } from "./export";
+import { buildSettingsBackupFileName, buildSettingsExportFileName, resolveUniqueFilePath } from "./export";
 
 type SyncTask = {
   id: string;
@@ -25,6 +25,8 @@ type ExternalSyncSettings = {
   scheduleMode: "interval" | "daily";
   intervalMinutes: number;
   dailyTime: string;
+  autoBackupEnabled: boolean;
+  autoBackupDir: string;
 };
 
 const DEFAULT_SETTINGS: ExternalSyncSettings = {
@@ -35,7 +37,9 @@ const DEFAULT_SETTINGS: ExternalSyncSettings = {
   scheduleEnabled: false,
   scheduleMode: "interval",
   intervalMinutes: 60,
-  dailyTime: "09:00"
+  dailyTime: "09:00",
+  autoBackupEnabled: false,
+  autoBackupDir: ""
 };
 
 export default class ExternalSyncBridgePlugin extends Plugin {
@@ -43,6 +47,8 @@ export default class ExternalSyncBridgePlugin extends Plugin {
   private styleEl: HTMLStyleElement | null = null;
   private scheduleIntervalId: number | null = null;
   private scheduleTimeoutId: number | null = null;
+  private autoBackupTimeoutId: number | null = null;
+  private lastAutoBackupErrorAtMs: number | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -76,6 +82,7 @@ export default class ExternalSyncBridgePlugin extends Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     this.setupSchedule();
+    this.queueAutoBackup();
   }
 
   exportSettings(): string {
@@ -93,7 +100,7 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     }
   }
 
-  private async pickDirectory(defaultPath?: string): Promise<string | null> {
+  async pickDirectory(defaultPath?: string): Promise<string | null> {
     const dialog = this.getElectronDialog();
     if (!dialog) {
       new Notice("无法打开系统选择器。");
@@ -143,10 +150,16 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     settings.scheduleMode = settings.scheduleMode === "daily" ? "daily" : "interval";
     settings.intervalMinutes = Number.isFinite(settings.intervalMinutes) ? settings.intervalMinutes : 60;
     settings.dailyTime = typeof settings.dailyTime === "string" ? settings.dailyTime : "09:00";
+    settings.autoBackupEnabled = Boolean(settings.autoBackupEnabled);
+    settings.autoBackupDir = typeof settings.autoBackupDir === "string" ? settings.autoBackupDir : "";
   }
 
   onunload() {
     this.clearSchedule();
+    if (this.autoBackupTimeoutId !== null) {
+      window.clearTimeout(this.autoBackupTimeoutId);
+      this.autoBackupTimeoutId = null;
+    }
     if (this.styleEl && this.styleEl.parentElement) {
       this.styleEl.parentElement.removeChild(this.styleEl);
       this.styleEl = null;
@@ -258,6 +271,40 @@ export default class ExternalSyncBridgePlugin extends Plugin {
       return null;
     }
     return adapter.getBasePath();
+  }
+
+  private queueAutoBackup() {
+    if (this.autoBackupTimeoutId !== null) {
+      window.clearTimeout(this.autoBackupTimeoutId);
+      this.autoBackupTimeoutId = null;
+    }
+
+    if (!this.settings.autoBackupEnabled) return;
+    const dir = (this.settings.autoBackupDir || "").trim();
+    if (!dir) return;
+
+    this.autoBackupTimeoutId = window.setTimeout(() => {
+      this.autoBackupTimeoutId = null;
+      this.performAutoBackup(dir);
+    }, 750);
+  }
+
+  private async performAutoBackup(dir: string) {
+    try {
+      await fsExtra.ensureDir(dir);
+      const fileName = buildSettingsBackupFileName(new Date());
+      const filePath = resolveUniqueFilePath(dir, fileName, (candidate) => fs.existsSync(candidate));
+      await fs.promises.writeFile(filePath, this.exportSettings(), "utf8");
+      console.log("[External Sync Bridge] 配置已自动备份到", filePath);
+    } catch (error) {
+      console.error("[External Sync Bridge] 自动备份配置失败", error);
+      const now = Date.now();
+      const last = this.lastAutoBackupErrorAtMs;
+      if (last === null || now - last >= 60_000) {
+        this.lastAutoBackupErrorAtMs = now;
+        new Notice(`自动备份失败：${formatErrorReasonForNotice(error)}`);
+      }
+    }
   }
 
   private validateTask(
@@ -665,6 +712,39 @@ class ExternalSyncSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("导入").onClick(() => {
           this.plugin.showImportModal();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("自动备份配置")
+      .setDesc(
+        `开启后，每次配置变更都会在备份文件夹中保存一份 JSON。当前：${
+          this.plugin.settings.autoBackupDir ? this.plugin.settings.autoBackupDir : "(未设置)"
+        }`
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoBackupEnabled).onChange(async (value) => {
+          this.plugin.settings.autoBackupEnabled = value;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("选择文件夹").onClick(async () => {
+          const selected = await this.plugin.pickDirectory(
+            this.plugin.settings.autoBackupDir || this.plugin.getVaultBasePath() || undefined
+          );
+          if (!selected) return;
+          this.plugin.settings.autoBackupDir = selected;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("清除").onClick(async () => {
+          this.plugin.settings.autoBackupDir = "";
+          await this.plugin.saveSettings();
+          this.display();
         })
       );
 

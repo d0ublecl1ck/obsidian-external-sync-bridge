@@ -4,11 +4,19 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-export function buildSettingsExportFileName(date: Date): string {
+function buildSettingsJsonFileName(prefix: string, date: Date): string {
   const stamp = `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}-${pad2(
     date.getHours()
   )}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`;
-  return `external-sync-bridge-settings-${stamp}.json`;
+  return `${prefix}-${stamp}.json`;
+}
+
+export function buildSettingsExportFileName(date: Date): string {
+  return buildSettingsJsonFileName("external-sync-bridge-settings", date);
+}
+
+export function buildSettingsBackupFileName(date: Date): string {
+  return buildSettingsJsonFileName("external-sync-bridge-settings-backup", date);
 }
 
 export function resolveUniqueFilePath(
@@ -29,4 +37,3 @@ export function resolveUniqueFilePath(
 
   throw new Error("Unable to create unique export file name.");
 }
-
