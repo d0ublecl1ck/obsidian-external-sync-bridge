@@ -7,6 +7,7 @@ import micromatch from "micromatch";
 import { formatErrorReason, formatErrorReasonForNotice } from "./error";
 import { ensureCopyTargetCompatible } from "./fs-conflicts";
 import { buildSettingsBackupFileName, buildSettingsExportFileName, resolveUniqueFilePath } from "./export";
+import { validateSyncTask } from "./task-validate";
 
 type SyncTask = {
   id: string;
@@ -14,6 +15,7 @@ type SyncTask = {
   sourcePath: string;
   targetPath: string;
   enabled: boolean;
+  ignoreMissingSource: boolean;
 };
 
 type ExternalSyncSettings = {
@@ -145,6 +147,14 @@ export default class ExternalSyncBridgePlugin extends Plugin {
   private normalizeSettings() {
     const settings = this.settings;
     settings.tasks = Array.isArray(settings.tasks) ? settings.tasks : [];
+    settings.tasks = settings.tasks.map((task) => ({
+      id: typeof task.id === "string" ? task.id : crypto.randomUUID(),
+      name: typeof task.name === "string" ? task.name : "",
+      sourcePath: typeof task.sourcePath === "string" ? task.sourcePath : "",
+      targetPath: typeof task.targetPath === "string" ? task.targetPath : "",
+      enabled: Boolean(task.enabled),
+      ignoreMissingSource: Boolean((task as any).ignoreMissingSource)
+    }));
     settings.excludePatterns = Array.isArray(settings.excludePatterns) ? settings.excludePatterns : [];
     settings.compareMode = settings.compareMode === "hash" ? "hash" : "mtime";
     settings.scheduleEnabled = Boolean(settings.scheduleEnabled);
@@ -308,59 +318,6 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     }
   }
 
-  private validateTask(
-    task: SyncTask,
-    vaultBasePath: string
-  ): { ok: true; source: string; target: string } | { ok: false; reason: string } {
-    if (!task.sourcePath.trim()) {
-      return { ok: false, reason: "源路径为空" };
-    }
-    if (!task.targetPath.trim()) {
-      return { ok: false, reason: "目标路径为空" };
-    }
-
-    const source = path.normalize(task.sourcePath);
-    if (!fs.existsSync(source)) {
-      return { ok: false, reason: "源路径不存在" };
-    }
-
-    const targetBase = path.normalize(task.targetPath);
-    const targetAbs = path.join(vaultBasePath, targetBase);
-    const rel = path.relative(vaultBasePath, targetAbs);
-    if (rel.startsWith("..")) {
-      return { ok: false, reason: "目标路径必须在 Vault 内" };
-    }
-
-    let targetAbsStat: fs.Stats | null = null;
-    if (fs.existsSync(targetAbs)) {
-      try {
-        targetAbsStat = fs.statSync(targetAbs);
-      } catch (error) {
-        return { ok: false, reason: `无法访问目标路径：${formatErrorReason(error)}` };
-      }
-    }
-
-    let sourceStat: fs.Stats;
-    try {
-      sourceStat = fs.statSync(source);
-    } catch (error) {
-      return { ok: false, reason: `无法访问源路径：${formatErrorReason(error)}` };
-    }
-    let finalTarget = targetAbs;
-    if (sourceStat.isFile()) {
-      const targetEndsWithSlash = task.targetPath.endsWith("/") || task.targetPath.endsWith(path.sep);
-      if (targetEndsWithSlash || (targetAbsStat && targetAbsStat.isDirectory())) {
-        finalTarget = path.join(targetAbs, path.basename(source));
-      }
-    } else if (sourceStat.isDirectory()) {
-      if (targetAbsStat && targetAbsStat.isFile()) {
-        return { ok: false, reason: "源为目录时目标不能是文件" };
-      }
-    }
-
-    return { ok: true, source, target: finalTarget };
-  }
-
   private async hashFile(filePath: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const hash = createHash("sha256");
@@ -385,24 +342,31 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     }
 
     let successCount = 0;
+    let skippedCount = 0;
     let failCount = 0;
     const failures: string[] = [];
 
     for (const task of enabledTasks) {
       const result = await this.syncTaskInternal(task, vaultBasePath);
       if (result.ok) {
-        successCount++;
+        if (result.skipped) {
+          skippedCount++;
+        } else {
+          successCount++;
+        }
       } else {
         failCount++;
         failures.push(`${task.name || task.id}: ${result.reason}`);
       }
     }
 
-    if (successCount > 0) {
+    if (successCount + skippedCount > 0) {
       if (failCount > 0) {
-        new Notice(`同步完成：成功 ${successCount} 项，失败 ${failCount} 项（已弹出失败详情）。`);
+        new Notice(
+          `同步完成：成功 ${successCount} 项，跳过 ${skippedCount} 项，失败 ${failCount} 项（已弹出失败详情）。`
+        );
       } else {
-        new Notice(`同步完成：成功 ${successCount} 项，失败 0 项。`);
+        new Notice(`同步完成：成功 ${successCount} 项，跳过 ${skippedCount} 项，失败 0 项。`);
       }
     } else {
       if (failCount === 1 && failures.length === 1) {
@@ -426,7 +390,11 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     }
     const result = await this.syncTaskInternal(task, vaultBasePath);
     if (result.ok) {
-      new Notice(`任务同步成功：${task.name || task.id}`);
+      if (result.skipped) {
+        new Notice(`任务已跳过：${task.name || task.id}（源路径不存在已忽略）`);
+      } else {
+        new Notice(`任务同步成功：${task.name || task.id}`);
+      }
     } else {
       new Notice(`任务同步失败：${task.name || task.id}：${formatErrorReasonForNotice(result.reason)}`);
       this.showFailureModal([`${task.name || task.id}: ${result.reason}`]);
@@ -436,10 +404,12 @@ export default class ExternalSyncBridgePlugin extends Plugin {
   private async syncTaskInternal(
     task: SyncTask,
     vaultBasePath: string
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const validation = this.validateTask(task, vaultBasePath);
-    if (!validation.ok) {
-      return { ok: false, reason: validation.reason };
+  ): Promise<{ ok: true; skipped?: boolean } | { ok: false; reason: string }> {
+    const validation = validateSyncTask(task, vaultBasePath);
+    if (!validation.ok) return { ok: false, reason: validation.reason };
+    if (validation.action === "skip") {
+      console.log(`[External Sync Bridge] 已跳过任务: ${task.name || task.id}（${validation.reason}）`);
+      return { ok: true, skipped: true };
     }
 
     const source = validation.source;
@@ -954,7 +924,8 @@ class ExternalSyncSettingTab extends PluginSettingTab {
             name: "",
             sourcePath: "",
             targetPath: "",
-            enabled: true
+            enabled: true,
+            ignoreMissingSource: false
           };
           this.plugin.settings.tasks.push(task);
           await this.plugin.saveSettings();
@@ -1055,6 +1026,16 @@ class ExternalSyncSettingTab extends PluginSettingTab {
           .addToggle((toggle) =>
             toggle.setValue(task.enabled).onChange(async (value) => {
               task.enabled = value;
+              await plugin.saveSettings();
+            })
+          );
+
+        new Setting(contentEl)
+          .setName("源路径不存在时忽略")
+          .setDesc("适用于跨平台任务：当本机没有该源路径时跳过此任务，而不是报错")
+          .addToggle((toggle) =>
+            toggle.setValue(task.ignoreMissingSource).onChange(async (value) => {
+              task.ignoreMissingSource = value;
               await plugin.saveSettings();
             })
           );
