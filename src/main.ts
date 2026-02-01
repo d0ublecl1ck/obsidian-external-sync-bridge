@@ -6,6 +6,7 @@ import { createHash } from "crypto";
 import micromatch from "micromatch";
 import { formatErrorReason, formatErrorReasonForNotice } from "./error";
 import { ensureCopyTargetCompatible } from "./fs-conflicts";
+import { buildSettingsBackupFileName, buildSettingsExportFileName, resolveUniqueFilePath } from "./export";
 
 type SyncTask = {
   id: string;
@@ -24,6 +25,8 @@ type ExternalSyncSettings = {
   scheduleMode: "interval" | "daily";
   intervalMinutes: number;
   dailyTime: string;
+  autoBackupEnabled: boolean;
+  autoBackupDir: string;
 };
 
 const DEFAULT_SETTINGS: ExternalSyncSettings = {
@@ -34,7 +37,9 @@ const DEFAULT_SETTINGS: ExternalSyncSettings = {
   scheduleEnabled: false,
   scheduleMode: "interval",
   intervalMinutes: 60,
-  dailyTime: "09:00"
+  dailyTime: "09:00",
+  autoBackupEnabled: false,
+  autoBackupDir: ""
 };
 
 export default class ExternalSyncBridgePlugin extends Plugin {
@@ -42,6 +47,8 @@ export default class ExternalSyncBridgePlugin extends Plugin {
   private styleEl: HTMLStyleElement | null = null;
   private scheduleIntervalId: number | null = null;
   private scheduleTimeoutId: number | null = null;
+  private autoBackupTimeoutId: number | null = null;
+  private lastAutoBackupErrorAtMs: number | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -70,15 +77,62 @@ export default class ExternalSyncBridgePlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.normalizeSettings();
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
     this.setupSchedule();
+    this.queueAutoBackup();
   }
 
   exportSettings(): string {
     return JSON.stringify(this.settings, null, 2);
+  }
+
+  getElectronDialog(): { showOpenDialog: Function } | null {
+    try {
+      const electron = (window as any).require?.("electron");
+      if (!electron) return null;
+      return electron.dialog || electron.remote?.dialog || null;
+    } catch (error) {
+      console.error("[External Sync Bridge] 无法访问 electron dialog", error);
+      return null;
+    }
+  }
+
+  async pickDirectory(defaultPath?: string): Promise<string | null> {
+    const dialog = this.getElectronDialog();
+    if (!dialog) {
+      new Notice("无法打开系统选择器。");
+      return null;
+    }
+
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory", "createDirectory"],
+      defaultPath
+    });
+    if (result.canceled || !result.filePaths?.length) {
+      return null;
+    }
+    return result.filePaths[0];
+  }
+
+  async exportSettingsToFile(): Promise<void> {
+    const dir = await this.pickDirectory(this.getVaultBasePath() ?? undefined);
+    if (!dir) return;
+
+    const fileName = buildSettingsExportFileName(new Date());
+    const filePath = resolveUniqueFilePath(dir, fileName, (candidate) => fs.existsSync(candidate));
+
+    try {
+      await fs.promises.writeFile(filePath, this.exportSettings(), "utf8");
+      new Notice(`已导出配置到文件：${path.basename(filePath)}`);
+      console.log("[External Sync Bridge] 配置已导出到", filePath);
+    } catch (error) {
+      console.error("[External Sync Bridge] 导出配置到文件失败", error);
+      new Notice(`导出失败：${formatErrorReasonForNotice(error)}`);
+    }
   }
 
   async importSettings(json: string) {
@@ -97,10 +151,16 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     settings.scheduleMode = settings.scheduleMode === "daily" ? "daily" : "interval";
     settings.intervalMinutes = Number.isFinite(settings.intervalMinutes) ? settings.intervalMinutes : 60;
     settings.dailyTime = typeof settings.dailyTime === "string" ? settings.dailyTime : "09:00";
+    settings.autoBackupEnabled = Boolean(settings.autoBackupEnabled);
+    settings.autoBackupDir = typeof settings.autoBackupDir === "string" ? settings.autoBackupDir : "";
   }
 
   onunload() {
     this.clearSchedule();
+    if (this.autoBackupTimeoutId !== null) {
+      window.clearTimeout(this.autoBackupTimeoutId);
+      this.autoBackupTimeoutId = null;
+    }
     if (this.styleEl && this.styleEl.parentElement) {
       this.styleEl.parentElement.removeChild(this.styleEl);
       this.styleEl = null;
@@ -212,6 +272,40 @@ export default class ExternalSyncBridgePlugin extends Plugin {
       return null;
     }
     return adapter.getBasePath();
+  }
+
+  private queueAutoBackup() {
+    if (this.autoBackupTimeoutId !== null) {
+      window.clearTimeout(this.autoBackupTimeoutId);
+      this.autoBackupTimeoutId = null;
+    }
+
+    if (!this.settings.autoBackupEnabled) return;
+    const dir = (this.settings.autoBackupDir || "").trim();
+    if (!dir) return;
+
+    this.autoBackupTimeoutId = window.setTimeout(() => {
+      this.autoBackupTimeoutId = null;
+      this.performAutoBackup(dir);
+    }, 750);
+  }
+
+  private async performAutoBackup(dir: string) {
+    try {
+      await fsExtra.ensureDir(dir);
+      const fileName = buildSettingsBackupFileName(new Date());
+      const filePath = resolveUniqueFilePath(dir, fileName, (candidate) => fs.existsSync(candidate));
+      await fs.promises.writeFile(filePath, this.exportSettings(), "utf8");
+      console.log("[External Sync Bridge] 配置已自动备份到", filePath);
+    } catch (error) {
+      console.error("[External Sync Bridge] 自动备份配置失败", error);
+      const now = Date.now();
+      const last = this.lastAutoBackupErrorAtMs;
+      if (last === null || now - last >= 60_000) {
+        this.lastAutoBackupErrorAtMs = now;
+        new Notice(`自动备份失败：${formatErrorReasonForNotice(error)}`);
+      }
+    }
   }
 
   private validateTask(
@@ -456,6 +550,7 @@ export default class ExternalSyncBridgePlugin extends Plugin {
   }
 
   showExportModal() {
+    const plugin = this;
     class ExportModal extends Modal {
       private value: string;
       constructor(app: App, value: string) {
@@ -482,6 +577,17 @@ export default class ExternalSyncBridgePlugin extends Plugin {
             new Notice("复制失败");
           }
         });
+
+        const fileButton = actions.createEl("button", { text: "导出到文件" });
+        fileButton.addEventListener("click", async () => {
+          fileButton.disabled = true;
+          try {
+            await plugin.exportSettingsToFile();
+          } finally {
+            fileButton.disabled = false;
+          }
+        });
+
         const closeButton = actions.createEl("button", { text: "关闭" });
         closeButton.addEventListener("click", () => this.close());
       }
@@ -607,6 +713,39 @@ class ExternalSyncSettingTab extends PluginSettingTab {
       .addButton((button) =>
         button.setButtonText("导入").onClick(() => {
           this.plugin.showImportModal();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("自动备份配置")
+      .setDesc(
+        `开启后，每次配置变更都会在备份文件夹中保存一份 JSON。当前：${
+          this.plugin.settings.autoBackupDir ? this.plugin.settings.autoBackupDir : "(未设置)"
+        }`
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoBackupEnabled).onChange(async (value) => {
+          this.plugin.settings.autoBackupEnabled = value;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("选择文件夹").onClick(async () => {
+          const selected = await this.plugin.pickDirectory(
+            this.plugin.settings.autoBackupDir || this.plugin.getVaultBasePath() || undefined
+          );
+          if (!selected) return;
+          this.plugin.settings.autoBackupDir = selected;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      )
+      .addButton((button) =>
+        button.setButtonText("清除").onClick(async () => {
+          this.plugin.settings.autoBackupDir = "";
+          await this.plugin.saveSettings();
+          this.display();
         })
       );
 
@@ -943,19 +1082,8 @@ class ExternalSyncSettingTab extends PluginSettingTab {
     new TaskEditorModal(this.app).open();
   }
 
-  private getElectronDialog(): { showOpenDialog: Function } | null {
-    try {
-      const electron = (window as any).require?.("electron");
-      if (!electron) return null;
-      return electron.dialog || electron.remote?.dialog || null;
-    } catch (error) {
-      console.error("[External Sync Bridge] 无法访问 electron dialog", error);
-      return null;
-    }
-  }
-
   private async pickExternalPath(kind: "file" | "folder"): Promise<string | null> {
-    const dialog = this.getElectronDialog();
+    const dialog = this.plugin.getElectronDialog();
     if (!dialog) {
       new Notice("无法打开系统选择器。");
       return null;
@@ -974,7 +1102,7 @@ class ExternalSyncSettingTab extends PluginSettingTab {
       return this.pickVaultFolderModal();
     }
 
-    const dialog = this.getElectronDialog();
+    const dialog = this.plugin.getElectronDialog();
     const vaultBasePath = this.plugin.getVaultBasePath();
     if (!dialog || !vaultBasePath) {
       new Notice("无法打开 Vault 目录选择器。");
