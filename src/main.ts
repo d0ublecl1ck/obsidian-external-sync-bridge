@@ -6,6 +6,7 @@ import { createHash } from "crypto";
 import micromatch from "micromatch";
 import { formatErrorReason, formatErrorReasonForNotice } from "./error";
 import { ensureCopyTargetCompatible } from "./fs-conflicts";
+import { buildSettingsExportFileName, resolveUniqueFilePath } from "./export";
 
 type SyncTask = {
   id: string;
@@ -79,6 +80,51 @@ export default class ExternalSyncBridgePlugin extends Plugin {
 
   exportSettings(): string {
     return JSON.stringify(this.settings, null, 2);
+  }
+
+  getElectronDialog(): { showOpenDialog: Function } | null {
+    try {
+      const electron = (window as any).require?.("electron");
+      if (!electron) return null;
+      return electron.dialog || electron.remote?.dialog || null;
+    } catch (error) {
+      console.error("[External Sync Bridge] 无法访问 electron dialog", error);
+      return null;
+    }
+  }
+
+  private async pickDirectory(defaultPath?: string): Promise<string | null> {
+    const dialog = this.getElectronDialog();
+    if (!dialog) {
+      new Notice("无法打开系统选择器。");
+      return null;
+    }
+
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory", "createDirectory"],
+      defaultPath
+    });
+    if (result.canceled || !result.filePaths?.length) {
+      return null;
+    }
+    return result.filePaths[0];
+  }
+
+  async exportSettingsToFile(): Promise<void> {
+    const dir = await this.pickDirectory(this.getVaultBasePath() ?? undefined);
+    if (!dir) return;
+
+    const fileName = buildSettingsExportFileName(new Date());
+    const filePath = resolveUniqueFilePath(dir, fileName, (candidate) => fs.existsSync(candidate));
+
+    try {
+      await fs.promises.writeFile(filePath, this.exportSettings(), "utf8");
+      new Notice(`已导出配置到文件：${path.basename(filePath)}`);
+      console.log("[External Sync Bridge] 配置已导出到", filePath);
+    } catch (error) {
+      console.error("[External Sync Bridge] 导出配置到文件失败", error);
+      new Notice(`导出失败：${formatErrorReasonForNotice(error)}`);
+    }
   }
 
   async importSettings(json: string) {
@@ -456,6 +502,7 @@ export default class ExternalSyncBridgePlugin extends Plugin {
   }
 
   showExportModal() {
+    const plugin = this;
     class ExportModal extends Modal {
       private value: string;
       constructor(app: App, value: string) {
@@ -482,6 +529,17 @@ export default class ExternalSyncBridgePlugin extends Plugin {
             new Notice("复制失败");
           }
         });
+
+        const fileButton = actions.createEl("button", { text: "导出到文件" });
+        fileButton.addEventListener("click", async () => {
+          fileButton.disabled = true;
+          try {
+            await plugin.exportSettingsToFile();
+          } finally {
+            fileButton.disabled = false;
+          }
+        });
+
         const closeButton = actions.createEl("button", { text: "关闭" });
         closeButton.addEventListener("click", () => this.close());
       }
@@ -943,19 +1001,8 @@ class ExternalSyncSettingTab extends PluginSettingTab {
     new TaskEditorModal(this.app).open();
   }
 
-  private getElectronDialog(): { showOpenDialog: Function } | null {
-    try {
-      const electron = (window as any).require?.("electron");
-      if (!electron) return null;
-      return electron.dialog || electron.remote?.dialog || null;
-    } catch (error) {
-      console.error("[External Sync Bridge] 无法访问 electron dialog", error);
-      return null;
-    }
-  }
-
   private async pickExternalPath(kind: "file" | "folder"): Promise<string | null> {
-    const dialog = this.getElectronDialog();
+    const dialog = this.plugin.getElectronDialog();
     if (!dialog) {
       new Notice("无法打开系统选择器。");
       return null;
@@ -974,7 +1021,7 @@ class ExternalSyncSettingTab extends PluginSettingTab {
       return this.pickVaultFolderModal();
     }
 
-    const dialog = this.getElectronDialog();
+    const dialog = this.plugin.getElectronDialog();
     const vaultBasePath = this.plugin.getVaultBasePath();
     if (!dialog || !vaultBasePath) {
       new Notice("无法打开 Vault 目录选择器。");
