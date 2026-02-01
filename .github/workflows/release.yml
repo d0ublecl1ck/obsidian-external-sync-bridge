@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify version consistency
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+          if (pkg.version !== manifest.version) {
+            console.error(
+              `Version mismatch: package.json=${pkg.version} manifest.json=${manifest.version}`
+            );
+            process.exit(1);
+          }
+          console.log(`Version OK: ${manifest.version}`);
+          NODE
+
+      - name: Check existing tag
+        id: tag
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          TAG="v${VERSION}"
+          if git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release assets
+        if: steps.tag.outputs.exists == 'false'
+        run: |
+          mkdir -p release/external-sync-bridge
+          cp manifest.json main.js release/external-sync-bridge/
+          if [ -f styles.css ]; then cp styles.css release/external-sync-bridge/; fi
+          (cd release && zip -r "external-sync-bridge-${{ steps.tag.outputs.version }}.zip" external-sync-bridge)
+
+      - name: Create GitHub Release
+        if: steps.tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release/external-sync-bridge-${{ steps.tag.outputs.version }}.zip
+            release/external-sync-bridge/*
