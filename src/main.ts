@@ -4,6 +4,8 @@ import * as fs from "fs";
 import * as fsExtra from "fs-extra";
 import { createHash } from "crypto";
 import micromatch from "micromatch";
+import { formatErrorReason, formatErrorReasonForNotice } from "./error";
+import { ensureCopyTargetCompatible } from "./fs-conflicts";
 
 type SyncTask = {
   id: string;
@@ -235,15 +237,29 @@ export default class ExternalSyncBridgePlugin extends Plugin {
       return { ok: false, reason: "目标路径必须在 Vault 内" };
     }
 
-    const sourceStat = fs.statSync(source);
+    let targetAbsStat: fs.Stats | null = null;
+    if (fs.existsSync(targetAbs)) {
+      try {
+        targetAbsStat = fs.statSync(targetAbs);
+      } catch (error) {
+        return { ok: false, reason: `无法访问目标路径：${formatErrorReason(error)}` };
+      }
+    }
+
+    let sourceStat: fs.Stats;
+    try {
+      sourceStat = fs.statSync(source);
+    } catch (error) {
+      return { ok: false, reason: `无法访问源路径：${formatErrorReason(error)}` };
+    }
     let finalTarget = targetAbs;
     if (sourceStat.isFile()) {
       const targetEndsWithSlash = task.targetPath.endsWith("/") || task.targetPath.endsWith(path.sep);
-      if (targetEndsWithSlash || (fs.existsSync(targetAbs) && fs.statSync(targetAbs).isDirectory())) {
+      if (targetEndsWithSlash || (targetAbsStat && targetAbsStat.isDirectory())) {
         finalTarget = path.join(targetAbs, path.basename(source));
       }
     } else if (sourceStat.isDirectory()) {
-      if (fs.existsSync(targetAbs) && fs.statSync(targetAbs).isFile()) {
+      if (targetAbsStat && targetAbsStat.isFile()) {
         return { ok: false, reason: "源为目录时目标不能是文件" };
       }
     }
@@ -289,9 +305,17 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     }
 
     if (successCount > 0) {
-      new Notice(`同步完成：成功 ${successCount} 项，失败 ${failCount} 项。`);
+      if (failCount > 0) {
+        new Notice(`同步完成：成功 ${successCount} 项，失败 ${failCount} 项（已弹出失败详情）。`);
+      } else {
+        new Notice(`同步完成：成功 ${successCount} 项，失败 0 项。`);
+      }
     } else {
-      new Notice(`同步失败：失败 ${failCount} 项。`);
+      if (failCount === 1 && failures.length === 1) {
+        new Notice(`同步失败：${formatErrorReasonForNotice(failures[0], 200)}`);
+      } else {
+        new Notice(`同步失败：失败 ${failCount} 项（已弹出失败详情）。`);
+      }
     }
 
     if (failures.length > 0) {
@@ -310,7 +334,7 @@ export default class ExternalSyncBridgePlugin extends Plugin {
     if (result.ok) {
       new Notice(`任务同步成功：${task.name || task.id}`);
     } else {
-      new Notice(`任务同步失败：${task.name || task.id}`);
+      new Notice(`任务同步失败：${task.name || task.id}：${formatErrorReasonForNotice(result.reason)}`);
       this.showFailureModal([`${task.name || task.id}: ${result.reason}`]);
     }
   }
@@ -333,9 +357,15 @@ export default class ExternalSyncBridgePlugin extends Plugin {
       const excludePatterns = this.settings.excludePatterns;
       const sourceRoot = source;
       const compareMode = this.settings.compareMode;
+      const dereferenceSymlinks = true;
+      const conflictBaseDir = (await fs.promises.stat(source)).isDirectory() ? target : path.dirname(target);
+      const now = new Date();
+      const stamp = now.toISOString().replace(/[:.]/g, "-");
+      const trashSessionDir = path.join(conflictBaseDir, ".trash", "external-sync-bridge", stamp);
 
       await fsExtra.copy(source, target, {
         overwrite: true,
+        dereference: dereferenceSymlinks,
         preserveTimestamps: true,
         filter: async (src, dest) => {
           const rel = path.relative(sourceRoot, src);
@@ -347,6 +377,13 @@ export default class ExternalSyncBridgePlugin extends Plugin {
           }
 
           try {
+            await ensureCopyTargetCompatible({
+              src,
+              dest,
+              destBaseDir: conflictBaseDir,
+              trashSessionDir
+            });
+
             const srcStat = await fs.promises.stat(src);
             if (srcStat.isDirectory()) {
               return true;
@@ -379,8 +416,8 @@ export default class ExternalSyncBridgePlugin extends Plugin {
       });
       return { ok: true };
     } catch (error) {
-      console.error(`[External Sync Bridge] 同步失败: ${task.name}`, error);
-      return { ok: false, reason: "同步失败" };
+      console.error(`[External Sync Bridge] 同步失败: ${task.name || task.id}`, error);
+      return { ok: false, reason: formatErrorReason(error) };
     }
   }
 
